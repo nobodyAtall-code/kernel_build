@@ -86,6 +86,21 @@ jobs:
             clang --version | head -n 1
           } > artifacts/build-info.txt
 
+      - name: Validate required Xiaomi proprietary kernel sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Checking source-tree dependencies before kernel configuration"
+          if [ -L kernel/drivers/mihw ]; then
+            echo "drivers/mihw -> $(readlink kernel/drivers/mihw)"
+          fi
+          if [ ! -f kernel/drivers/mihw/Kconfig ]; then
+            echo "::error file=kernel/drivers/Kconfig,line=248::Missing Xiaomi mihw driver source. drivers/mihw is a symlink to ../../../vendor/xiaomi/proprietary/mihw; kernel-only checkout lacks that repository. Restore the matching Xiaomi proprietary source tree before building."
+            echo "Kernel source SHA: $(git -C kernel rev-parse HEAD)"
+            exit 1
+          fi
+          echo "Xiaomi mihw Kconfig available"
+
       - name: Configure mist kernel
         shell: bash
         working-directory: kernel
