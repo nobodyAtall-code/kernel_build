@@ -1,0 +1,142 @@
+name: Build Xiaomi mist kernel (6.6)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: "Branch, tag or commit in android_kernel_xiaomi_mist"
+        required: true
+        default: "main"
+        type: string
+      jobs:
+        description: "Build kernel Image, DTBs and modules"
+        required: true
+        default: "Image.gz dtbs modules"
+        type: choice
+        options:
+          - "Image.gz dtbs modules"
+          - "Image.gz"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-mist-kernel.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mist-kernel-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    env:
+      ARCH: arm64
+      LLVM: "1"
+      LLVM_IAS: "1"
+      KBUILD_BUILD_USER: nobodyAtall-code
+      KBUILD_BUILD_HOST: github-actions
+      KCFLAGS: "-Wno-error"
+    steps:
+      - name: Checkout kernel_build
+        uses: actions/checkout@v4
+        with:
+          path: build-tools
+          persist-credentials: false
+
+      - name: Install kernel build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang llvm lld make gcc g++ git python3 python3-pip \
+            bc bison flex libssl-dev libelf-dev libncurses-dev \
+            dwarves device-tree-compiler rsync cpio lz4 zstd xz-utils
+          clang --version
+          ld.lld --version
+
+      - name: Checkout Xiaomi mist kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: nobodyAtall-code/android_kernel_xiaomi_mist
+          ref: ${{ inputs.kernel_ref || 'main' }}
+          path: kernel
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify mist sources and record build inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f kernel/Makefile
+          test -f kernel/arch/arm64/configs/gki_defconfig
+          test -f kernel/arch/arm64/configs/vendor/mist_perf.config
+          echo "Kernel commit: $(git -C kernel rev-parse HEAD)"
+          echo "Build tools commit: $(git -C build-tools rev-parse HEAD)"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' kernel/Makefile
+          df -h .
+          mkdir -p artifacts
+          {
+            echo "Kernel source: https://github.com/nobodyAtall-code/android_kernel_xiaomi_mist"
+            echo "Kernel SHA: $(git -C kernel rev-parse HEAD)"
+            echo "Build tools SHA: $(git -C build-tools rev-parse HEAD)"
+            echo "Base config: arch/arm64/configs/gki_defconfig"
+            echo "Device fragment: arch/arm64/configs/vendor/mist_perf.config"
+            clang --version | head -n 1
+          } > artifacts/build-info.txt
+
+      - name: Configure mist kernel
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          make O="$GITHUB_WORKSPACE/out" gki_defconfig
+          scripts/kconfig/merge_config.sh -m -O "$GITHUB_WORKSPACE/out" \
+            "$GITHUB_WORKSPACE/out/.config" \
+            arch/arm64/configs/vendor/mist_perf.config
+          make O="$GITHUB_WORKSPACE/out" olddefconfig
+          cp "$GITHUB_WORKSPACE/out/.config" "$GITHUB_WORKSPACE/artifacts/mist.config"
+          for key in CONFIG_ARCH_PARROT CONFIG_ARCH_RAVELIN; do
+            if ! grep -qx "${key}=y" "$GITHUB_WORKSPACE/out/.config"; then
+              echo "::error::Missing mist platform setting ${key}=y"
+              exit 1
+            fi
+          done
+
+      - name: Build kernel
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          goals="${{ inputs.jobs || 'Image.gz dtbs modules' }}"
+          # shellcheck disable=SC2086
+          make O="$GITHUB_WORKSPACE/out" -j2 $goals 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/build.log"
+
+      - name: Collect outputs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/boot
+          for f in out/arch/arm64/boot/Image out/arch/arm64/boot/Image.gz out/arch/arm64/boot/Image.lz4; do
+            if [ -s "$f" ]; then cp "$f" artifacts/boot/; fi
+          done
+          if [ -d out/arch/arm64/boot/dts ]; then
+            find out/arch/arm64/boot/dts -name '*.dtb' -type f -print0 | \
+              tar --null -T - -czf artifacts/dtbs.tar.gz 2>/dev/null || true
+          fi
+          if [ -d out ]; then
+            find out -type f -name '*.ko' -print > artifacts/modules-list.txt
+          fi
+          ls -lah artifacts artifacts/boot || true
+
+      - name: Upload build outputs and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mist-kernel-${{ github.run_number }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 7
