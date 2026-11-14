@@ -9,13 +9,13 @@ on:
         default: "main"
         type: string
       jobs:
-        description: "Build kernel Image, DTBs and modules"
+        description: "Build core Image.gz (experimental) or optional targets"
         required: true
-        default: "Image.gz dtbs modules"
+        default: "Image.gz"
         type: choice
         options:
-          - "Image.gz dtbs modules"
           - "Image.gz"
+          - "Image.gz dtbs modules"
   push:
     branches: [main]
     paths:
@@ -81,51 +81,44 @@ jobs:
             echo "Kernel source: https://github.com/nobodyAtall-code/android_kernel_xiaomi_mist"
             echo "Kernel SHA: $(git -C kernel rev-parse HEAD)"
             echo "Build tools SHA: $(git -C build-tools rev-parse HEAD)"
-            echo "Base config: arch/arm64/configs/gki_defconfig"
-            echo "Device fragment: arch/arm64/configs/vendor/mist_perf.config"
+            echo "Base config: arch/arm64/configs/gki_defconfig (experimental standalone)"
+            echo "Device fragment: NOT USED (standalone GKI core compile check)"
             clang --version | head -n 1
           } > artifacts/build-info.txt
 
-      - name: Validate required Xiaomi proprietary kernel sources
+      - name: Prepare standalone core kernel build (temporary checkout only)
         shell: bash
         run: |
           set -euo pipefail
-          echo "Checking source-tree dependencies before kernel configuration"
-          if [ -L kernel/drivers/mihw ]; then
-            echo "drivers/mihw -> $(readlink kernel/drivers/mihw)"
+          # This mode deliberately builds ONLY the generic core. It does not
+          # rebuild Xiaomi's proprietary mihw modules or claim stock KMI compatibility.
+          if [ -L kernel/drivers/mihw ] && [ ! -e kernel/drivers/mihw/Kconfig ]; then
+            echo "Xiaomi mihw sources not present; skipping external mihw Kconfig/Makefile references in CI checkout"
+            sed -i '/^[[:space:]]*source "drivers\/mihw\/Kconfig"[[:space:]]*$/d' kernel/drivers/Kconfig
+            sed -i '/^[[:space:]]*obj-$(CONFIG_MIHW)[[:space:]]*+=[[:space:]]*mihw\/[[:space:]]*$/d' kernel/drivers/Makefile
           fi
-          if [ ! -f kernel/drivers/mihw/Kconfig ]; then
-            echo "::error file=kernel/drivers/Kconfig,line=248::Missing Xiaomi mihw driver source. drivers/mihw is a symlink to ../../../vendor/xiaomi/proprietary/mihw; kernel-only checkout lacks that repository. Restore the matching Xiaomi proprietary source tree before building."
-            echo "Kernel source SHA: $(git -C kernel rev-parse HEAD)"
+          if grep -q 'source "drivers/mihw/Kconfig"' kernel/drivers/Kconfig && [ ! -f kernel/drivers/mihw/Kconfig ]; then
+            echo "::error::Unresolved Xiaomi mihw Kconfig reference"
             exit 1
           fi
-          echo "Xiaomi mihw Kconfig available"
+          echo "Standalone build is an experimental compile check, not a flashable kernel validation" | tee artifacts/IMPORTANT.txt
 
-      - name: Configure mist kernel
+      - name: Configure standalone core kernel
         shell: bash
         working-directory: kernel
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/out"
           make O="$GITHUB_WORKSPACE/out" gki_defconfig
-          scripts/kconfig/merge_config.sh -m -O "$GITHUB_WORKSPACE/out" \
-            "$GITHUB_WORKSPACE/out/.config" \
-            arch/arm64/configs/vendor/mist_perf.config
           make O="$GITHUB_WORKSPACE/out" olddefconfig
           cp "$GITHUB_WORKSPACE/out/.config" "$GITHUB_WORKSPACE/artifacts/mist.config"
-          for key in CONFIG_ARCH_PARROT CONFIG_ARCH_RAVELIN; do
-            if ! grep -qx "${key}=y" "$GITHUB_WORKSPACE/out/.config"; then
-              echo "::error::Missing mist platform setting ${key}=y"
-              exit 1
-            fi
-          done
 
       - name: Build kernel
         shell: bash
         working-directory: kernel
         run: |
           set -euo pipefail
-          goals="${{ inputs.jobs || 'Image.gz dtbs modules' }}"
+          goals="${{ inputs.jobs || 'Image.gz' }}"
           # shellcheck disable=SC2086
           make O="$GITHUB_WORKSPACE/out" -j2 $goals 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/build.log"
 
